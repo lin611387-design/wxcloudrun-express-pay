@@ -33,6 +33,18 @@ app.post("/api/count", async (req, res) => {
   });
 });
 
+// 微信支付回调
+app.post("/pay/notify", async (req, res) => {
+  console.log("pay notify body:", JSON.stringify(req.body || {}));
+
+  // 先让微信认为成功，后面再慢慢补验签/解密/更新订单逻辑
+  res.status(200).json({
+    code: "SUCCESS",
+    message: "成功",
+  });
+});
+
+
 // 获取计数
 app.get("/api/count", async (req, res) => {
   const result = await Counter.count();
