@@ -8,32 +8,40 @@ const tcb = require("@cloudbase/node-sdk");
 const app = express();
 const logger = morgan("tiny");
 
+// ------------------ 配置 ------------------
+
 const WECHAT_API_V3_KEY = process.env.WECHAT_API_V3_KEY || "";
 
-// ------- 初始化云开发（TCB） -------
+// ------------------ 初始化云开发（TCB） ------------------
+
+// 云托管一般会注入 TCB_ENV 或 WX_ENV，二选一兜底一下
+const tcbEnvId = process.env.TCB_ENV || process.env.WX_ENV;
+
+if (!tcbEnvId) {
+  console.error("[tcb] missing env id, TCB_ENV / WX_ENV not set");
+}
 
 const tcbApp = tcb.init({
-  env: process.env.TCB_ENV, // 云托管会自动注入当前环境 ID
-  secretId: process.env.TENCENTCLOUD_SECRETID,
-  secretKey: process.env.TENCENTCLOUD_SECRETKEY,
+  env: tcbEnvId,
 });
 
-const tcbDb = tcbApp.database();
+const db = tcbApp.database();
+const ORDERS = db.collection("orders");
 
-// ------- 中间件 -------
+// ------------------ 中间件 ------------------
 
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 app.use(cors());
 app.use(logger);
 
-// ------- 首页 -------
+// ------------------ 首页 ------------------
 
 app.get("/", async (req, res) => {
   res.sendFile(path.join(__dirname, "index.html"));
 });
 
-// ------- 解密工具函数 -------
+// ------------------ 解密工具函数 ------------------
 
 function decryptNotifyResource(resource) {
   if (!resource || !resource.ciphertext) return null;
@@ -62,7 +70,7 @@ function decryptNotifyResource(resource) {
   return JSON.parse(decoded);
 }
 
-// ------- 微信支付回调 -------
+// ------------------ 微信支付回调 ------------------
 
 app.post("/pay/notify", async (req, res) => {
   try {
@@ -75,43 +83,55 @@ app.post("/pay/notify", async (req, res) => {
     console.log("decrypted pay notify:", JSON.stringify(plain || {}, null, 2));
 
     // 简单判断支付成功
-    if (event_type === "TRANSACTION.SUCCESS" && plain && plain.trade_state === "SUCCESS") {
-      const outTradeNo = plain.out_trade_no;
-      const transactionId = plain.transaction_id;
-      const successTime = plain.success_time;
+    if (
+      event_type === "TRANSACTION.SUCCESS" &&
+      plain &&
+      plain.trade_state === "SUCCESS"
+    ) {
+      const outTradeNo = String(plain.out_trade_no || "");
+      const transactionId = plain.transaction_id || "";
+      const successTime = plain.success_time || "";
 
-      console.log("[pay notify] paid order:", outTradeNo, transactionId);
+      console.log(
+        "[pay notify] paid order:",
+        outTradeNo,
+        "transactionId:",
+        transactionId
+      );
 
-      // 更新云开发 orders 集合里的订单状态为 PAID
-      try {
-        const now = Date.now();
-        const result = await tcbDb
-          .collection("orders")
-          .where({ outTradeNo })
-          .update({
+      if (!outTradeNo) {
+        console.error("[pay notify] missing outTradeNo in plain notify data");
+      } else {
+        // 更新云开发 orders 集合里的订单状态为 PAID
+        try {
+          const now = Date.now();
+
+          console.log(
+            "[pay notify] start update DB, outTradeNo =",
+            outTradeNo
+          );
+
+          const result = await ORDERS.where({
+            outTradeNo: outTradeNo,
+          }).update({
             status: "PAID",
             transactionId,
             successTime,
             updatedAt: now,
           });
 
-        console.log(
-          "[pay notify] order updated in DB:",
-          outTradeNo,
-          "matched:",
-          result.matched,
-          "modified:",
-          result.modified
-        );
-
-        if (!result.matched) {
-          console.warn(
-            "[pay notify] no order matched in DB for outTradeNo:",
-            outTradeNo
+          console.log(
+            "[pay notify] order updated in DB, outTradeNo:",
+            outTradeNo,
+            "result:",
+            JSON.stringify(result)
+          );
+        } catch (dbErr) {
+          console.error(
+            "[pay notify] DB update error:",
+            dbErr && dbErr.message ? dbErr.message : dbErr
           );
         }
-      } catch (dbErr) {
-        console.error("[pay notify] DB update error:", dbErr);
       }
     } else {
       console.warn("[pay notify] not success event:", event_type);
@@ -132,7 +152,7 @@ app.post("/pay/notify", async (req, res) => {
   }
 });
 
-// ------- 启动服务 -------
+// ------------------ 启动服务 ------------------
 
 const port = process.env.PORT || 80;
 
