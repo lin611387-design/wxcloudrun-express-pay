@@ -2,25 +2,38 @@ const path = require("path");
 const express = require("express");
 const cors = require("cors");
 const morgan = require("morgan");
+const crypto = require("crypto");
+const tcb = require("@cloudbase/node-sdk");
 
 const app = express();
 const logger = morgan("tiny");
 
-const crypto = require("crypto");
-
 const WECHAT_API_V3_KEY = process.env.WECHAT_API_V3_KEY || "";
 
+// ------- 初始化云开发（TCB） -------
 
-// 中间件
+const tcbApp = tcb.init({
+  env: process.env.TCB_ENV, // 云托管会自动注入当前环境 ID
+  secretId: process.env.TENCENTCLOUD_SECRETID,
+  secretKey: process.env.TENCENTCLOUD_SECRETKEY,
+});
+
+const tcbDb = tcbApp.database();
+
+// ------- 中间件 -------
+
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 app.use(cors());
 app.use(logger);
 
-// 首页
+// ------- 首页 -------
+
 app.get("/", async (req, res) => {
   res.sendFile(path.join(__dirname, "index.html"));
 });
+
+// ------- 解密工具函数 -------
 
 function decryptNotifyResource(resource) {
   if (!resource || !resource.ciphertext) return null;
@@ -49,7 +62,8 @@ function decryptNotifyResource(resource) {
   return JSON.parse(decoded);
 }
 
-// 微信支付回调
+// ------- 微信支付回调 -------
+
 app.post("/pay/notify", async (req, res) => {
   try {
     console.log("raw pay notify body:", JSON.stringify(req.body || {}));
@@ -66,15 +80,44 @@ app.post("/pay/notify", async (req, res) => {
       const transactionId = plain.transaction_id;
       const successTime = plain.success_time;
 
-      // TODO: 在这里根据 outTradeNo 去云开发 orders 集合里把订单状态改成 PAID
-      // 例如：updateOrderStatus(outTradeNo, { status: 'PAID', transactionId, successTime })
-
       console.log("[pay notify] paid order:", outTradeNo, transactionId);
+
+      // 更新云开发 orders 集合里的订单状态为 PAID
+      try {
+        const now = Date.now();
+        const result = await tcbDb
+          .collection("orders")
+          .where({ outTradeNo })
+          .update({
+            status: "PAID",
+            transactionId,
+            successTime,
+            updatedAt: now,
+          });
+
+        console.log(
+          "[pay notify] order updated in DB:",
+          outTradeNo,
+          "matched:",
+          result.matched,
+          "modified:",
+          result.modified
+        );
+
+        if (!result.matched) {
+          console.warn(
+            "[pay notify] no order matched in DB for outTradeNo:",
+            outTradeNo
+          );
+        }
+      } catch (dbErr) {
+        console.error("[pay notify] DB update error:", dbErr);
+      }
     } else {
       console.warn("[pay notify] not success event:", event_type);
     }
 
-    // 按微信要求返回 SUCCESS
+    // 按微信要求返回 SUCCESS（无论如何都返回 200）
     res.status(200).json({
       code: "SUCCESS",
       message: "成功",
@@ -89,6 +132,7 @@ app.post("/pay/notify", async (req, res) => {
   }
 });
 
+// ------- 启动服务 -------
 
 const port = process.env.PORT || 80;
 
