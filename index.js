@@ -8,19 +8,22 @@ const tcb = require("@cloudbase/node-sdk");
 const app = express();
 const logger = morgan("tiny");
 
-// ------------------ 配置 ------------------
+// ================== 配置区 ==================
 
+// 微信支付 APIv3 密钥（32 字符）
+// 在云托管「服务设置 → 环境变量」里配置：WECHAT_API_V3_KEY=你的密钥
 const WECHAT_API_V3_KEY = process.env.WECHAT_API_V3_KEY || "";
 
-// ------------------ 初始化云开发（TCB） ------------------
+// ================== 初始化云开发（TCB） ==================
 
-// 云托管一般会注入 TCB_ENV 或 WX_ENV，二选一兜底一下
+// 云托管一般会注入 TCB_ENV 或 WX_ENV，二选一兜底
 const tcbEnvId = process.env.TCB_ENV || process.env.WX_ENV;
 
 if (!tcbEnvId) {
   console.error("[tcb] missing env id, TCB_ENV / WX_ENV not set");
 }
 
+// 这里不强制 SecretId/SecretKey，走环境内默认身份
 const tcbApp = tcb.init({
   env: tcbEnvId,
 });
@@ -28,23 +31,24 @@ const tcbApp = tcb.init({
 const db = tcbApp.database();
 const ORDERS = db.collection("orders");
 
-// ------------------ 中间件 ------------------
+// ================== 中间件 ==================
 
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 app.use(cors());
 app.use(logger);
 
-// ------------------ 首页 ------------------
+// ================== 首页 ==================
 
 app.get("/", async (req, res) => {
   res.sendFile(path.join(__dirname, "index.html"));
 });
 
-// ------------------ 解密工具函数 ------------------
+// ================== 解密工具函数 ==================
 
 function decryptNotifyResource(resource) {
   if (!resource || !resource.ciphertext) return null;
+
   if (!WECHAT_API_V3_KEY) {
     console.error("[pay notify] missing WECHAT_API_V3_KEY env");
     return null;
@@ -57,7 +61,7 @@ function decryptNotifyResource(resource) {
   const aad = associated_data ? Buffer.from(associated_data, "utf8") : null;
   const buf = Buffer.from(ciphertext, "base64");
 
-  // AES-256-GCM: 密文 = data + tag(16字节)
+  // AES-256-GCM: 密文 = data + tag(16 字节)
   const authTag = buf.slice(buf.length - 16);
   const data = buf.slice(0, buf.length - 16);
 
@@ -70,27 +74,30 @@ function decryptNotifyResource(resource) {
   return JSON.parse(decoded);
 }
 
-// ------------------ 微信支付回调 ------------------
+// ================== 微信支付回调 ==================
 
 app.post("/pay/notify", async (req, res) => {
   try {
-    console.log("raw pay notify body:", JSON.stringify(req.body || {}));
+    console.log("[pay notify] raw body:", JSON.stringify(req.body || {}));
 
     const { resource, event_type } = req.body || {};
 
-    // 解密
+    // 1. 解密
     const plain = decryptNotifyResource(resource);
-    console.log("decrypted pay notify:", JSON.stringify(plain || {}, null, 2));
+    console.log(
+      "[pay notify] decrypted:",
+      JSON.stringify(plain || {}, null, 2)
+    );
 
-    // 简单判断支付成功
+    // 2. 只处理支付成功的通知
     if (
       event_type === "TRANSACTION.SUCCESS" &&
       plain &&
       plain.trade_state === "SUCCESS"
     ) {
-      const outTradeNo = String(plain.out_trade_no || "");
-      const transactionId = plain.transaction_id || "";
-      const successTime = plain.success_time || "";
+      const outTradeNo = plain.out_trade_no;
+      const transactionId = plain.transaction_id;
+      const successTime = plain.success_time;
 
       console.log(
         "[pay notify] paid order:",
@@ -99,45 +106,39 @@ app.post("/pay/notify", async (req, res) => {
         transactionId
       );
 
-      if (!outTradeNo) {
-        console.error("[pay notify] missing outTradeNo in plain notify data");
-      } else {
-        // 更新云开发 orders 集合里的订单状态为 PAID
-        try {
-          const now = Date.now();
+      // 3. 更新云开发 orders 集合里的订单状态为 PAID
+      try {
+        const now = Date.now();
 
-          console.log(
-            "[pay notify] start update DB, outTradeNo =",
-            outTradeNo
-          );
+        console.log("[pay notify] start update DB, outTradeNo =", outTradeNo);
 
-          const result = await ORDERS.where({
-            outTradeNo: outTradeNo,
-          }).update({
+        const result = await ORDERS.where({ outTradeNo }).update({
+          // ✅ TCB 正确写法：必须是 data: {...}
+          data: {
             status: "PAID",
             transactionId,
             successTime,
             updatedAt: now,
-          });
+          },
+        });
 
-          console.log(
-            "[pay notify] order updated in DB, outTradeNo:",
-            outTradeNo,
-            "result:",
-            JSON.stringify(result)
-          );
-        } catch (dbErr) {
-          console.error(
-            "[pay notify] DB update error:",
-            dbErr && dbErr.message ? dbErr.message : dbErr
+        console.log("[pay notify] DB update result:", result);
+
+        // node-sdk 一般返回 { requestId, updated }
+        if (!result || !result.updated) {
+          console.warn(
+            "[pay notify] DB update finished but no doc updated, outTradeNo:",
+            outTradeNo
           );
         }
+      } catch (dbErr) {
+        console.error("[pay notify] DB update error:", dbErr);
       }
     } else {
       console.warn("[pay notify] not success event:", event_type);
     }
 
-    // 按微信要求返回 SUCCESS（无论如何都返回 200）
+    // 4. 按微信要求：无论业务是否成功，都返回 200 + SUCCESS，避免重复推送
     res.status(200).json({
       code: "SUCCESS",
       message: "成功",
@@ -152,7 +153,7 @@ app.post("/pay/notify", async (req, res) => {
   }
 });
 
-// ------------------ 启动服务 ------------------
+// ================== 启动服务 ==================
 
 const port = process.env.PORT || 80;
 
